@@ -4,6 +4,9 @@ const pool = require('../db/index')
 const saltRounds = 10
 const jwt = require('jsonwebtoken')
 
+const { PrismaClient } = require('@prisma/client')
+const prisma = new PrismaClient()
+
 const register = async (req, res) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
@@ -13,28 +16,22 @@ const register = async (req, res) => {
   try {
     const { fName, lName, email, password } = req.body
     const hashedPassword = await bcrypt.hash(password, saltRounds)
-    const client = await pool.connect()
-    try {
-      const result = await client.query(
-        'INSERT INTO users (fName, lName, email, password) VALUES ($1, $2, $3, $4) RETURNING id',
-        [fName, lName, email, hashedPassword]
-      )
-      res.status(200).json({ message: 'Registration successful' })
-    } catch (queryError) {
-      if (queryError.code === '23505') {
-        res.status(400).json({ message: 'Email already exists' })
-      } else {
-        console.error('Error executing query:', queryError)
-        res.status(500).json({ message: 'Error executing query' })
-      }
-    } finally {
-      client.release()
+
+    const user = await prisma.user.create({
+      data: { fName, lName, email, password: hashedPassword }
+    })
+
+    res.status(200).json({ message: 'Registration successful', userId: user.id })
+  } catch (error) {
+    if (error.code === 'P2002') { // Unique constraint failed
+      res.status(400).json({ message: 'Email already exists' })
+    } else {
+      console.error('Error registering user:', error)
+      res.status(500).json({ message: 'Internal Server Error' })
     }
-  } catch (e) {
-    console.error(e)
-    res.status(500).json({ message: 'Internal Server Error' })
   }
 }
+
 let refreshTokens = []
 const login = async (req, res) => {
   const errors = validationResult(req)
@@ -44,45 +41,41 @@ const login = async (req, res) => {
 
   try {
     const { email, password } = req.body
-    const client = await pool.connect()
-    try {
-      const result = await client.query(
-        'SELECT password FROM users WHERE email = $1',
-        [email]
-      )
 
-      if (result.rows.length === 0) {
-        return res.status(400).json({ message: 'Invalid email or password' })
-      }
-      const user = result.rows[0]
-      const hashedPassword = user.password
-      const isMatch = await bcrypt.compare(password, hashedPassword)
+    const user = await prisma.user.findUnique({
+      where: { email }
+    })
 
-      if (!isMatch) {
-        return res.status(400).json({ message: 'Invalid email or password' })
-      }
-      const accessToken = jwt.sign(
-        { id: user.id, username: user.username },
-        process.env.ACCESS_TOKEN_SECRET,
-        { expiresIn: '1h' }
-      )
-      const refreshToken = jwt.sign(
-        { id: user.id, username: user.username },
-        process.env.REFRESH_TOKEN_SECRET,
-        { expiresIn: '7d' }
-      )
-      refreshTokens.push(refreshToken)
-
-      res.json({ accessToken, refreshToken })
-      // res.status(200).send('Login successful')
-    } finally {
-      client.release()
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid email or password' })
     }
-  } catch (e) {
-    console.error(e)
+
+    const isMatch = await bcrypt.compare(password, user.password)
+
+    if (!isMatch) {
+      return res.status(400).json({ message: 'Invalid email or password' })
+    }
+
+    const accessToken = jwt.sign(
+      { id: user.id, username: user.email },
+      process.env.ACCESS_TOKEN_SECRET,
+      { expiresIn: '1h' }
+    )
+    const refreshToken = jwt.sign(
+      { id: user.id, username: user.email },
+      process.env.REFRESH_TOKEN_SECRET,
+      { expiresIn: '7d' }
+    )
+    refreshTokens.push(refreshToken)
+
+    res.json({ accessToken, refreshToken })
+  } catch (error) {
+    console.error('Error logging in:', error)
     res.status(500).json({ message: 'Internal Server Error' })
   }
 }
+
+
 const token = (req, res) => {
   const { token } = req.body
   if (!token) return res.sendStatus(401)
@@ -98,8 +91,42 @@ const token = (req, res) => {
     res.json({ accessToken })
   })
 }
+
+// profile pic upload
+const multer = require('multer');
+const multerS3 = require('multer-s3');
+const AWS = require('aws-sdk');
+
+// Configure AWS S3
+const s3 = new AWS.S3({
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  region: process.env.AWS_REGION,
+});
+
+// Set up Multer to use S3 for storage
+const upload = multer({
+  storage: multerS3({
+    s3: s3,
+    bucket: 'your-s3-bucket-name',
+    metadata: (req, file, cb) => {
+      cb(null, { fieldName: file.fieldname });
+    },
+    key: (req, file, cb) => {
+      cb(null, Date.now().toString() + '-' + file.originalname);
+    },
+  }),
+});
+
+
+
+
+
+
+
 module.exports = {
   register,
   login,
-  token
+  token,
+  upload
 }
